@@ -1,10 +1,12 @@
 use axum::extract::State;
 use axum::{routing::get, Json, Router};
 use bip39::Mnemonic;
+use chia::protocol::Coin;
 use chia::puzzles::standard::StandardArgs;
 use chia::puzzles::DeriveSynthetic;
 use chia_bls::{master_to_wallet_unhardened, SecretKey};
-use chia_wallet_sdk::encode_address;
+use chia_wallet_sdk::{decode_puzzle_hash, encode_address, StandardLayer};
+use serde::Deserialize;
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -63,6 +65,26 @@ async fn handle_offers(State(state): State<Arc<RwLock<WalletState>>>) -> Json<se
     Json(wallet.to_json())
 }
 
+#[derive(Deserialize)]
+struct CoinRecord {
+    coin: DeserializableCoin,
+    // We don't need to define the other fields since we won't use them
+    #[serde(skip)]
+    _ignored: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CoinRecordsResponse {
+    coin_records: Vec<CoinRecord>,
+}
+
+#[derive(Deserialize)]
+struct DeserializableCoin {
+    amount: u64,
+    parent_coin_info: String,
+    puzzle_hash: String,
+}
+
 async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic: &str) {
     println!(
         "[{}] Refreshing wallet...",
@@ -74,7 +96,7 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     let sk = master_to_wallet_unhardened(&SecretKey::from_seed(&seed), 0).derive_synthetic();
     let pk = sk.public_key();
 
-    // let layer = StandardLayer::new(pk);
+    let layer = StandardLayer::new(pk);
     let wallet_puzzle_hash = StandardArgs::curry_tree_hash(pk);
     if startup {
         let address = encode_address(wallet_puzzle_hash.into(), "xch");
@@ -85,8 +107,39 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
         );
     }
 
+    let response = reqwest::Client::new()
+        .post("https://api.coinset.org/get_coin_records_by_puzzle_hash")
+        .json(&serde_json::json!({
+            "puzzle_hash": wallet_puzzle_hash.to_string(),
+            "start_height": 63000000,
+            "end_height": 0,
+            "include_spent_coins": false
+        }))
+        .send()
+        .await
+        .expect("Failed to send request")
+        .json::<CoinRecordsResponse>()
+        .await
+        .expect("Failed to parse response");
+
+    let coins: Vec<Coin> = response
+        .coin_records
+        .into_iter()
+        .map(|record| {
+            Coin::new(
+                decode_puzzle_hash(&record.coin.parent_coin_info)
+                    .unwrap()
+                    .into(),
+                decode_puzzle_hash(&record.coin.puzzle_hash).unwrap().into(),
+                record.coin.amount,
+            )
+        })
+        .collect();
+
+    println!("Coins: {:?}", coins);
+
     let mut wallet = state.write().await;
-    wallet.funds = 1337;
+    wallet.funds = coins.iter().map(|c| c.amount).sum();
 }
 
 async fn scheduled_task(state: Arc<RwLock<WalletState>>, mnemonic: String) {
