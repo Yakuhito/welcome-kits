@@ -1,7 +1,12 @@
 use axum::extract::State;
 use axum::{routing::get, Json, Router};
-use chia::protocol::Bytes32;
+use bip39::Mnemonic;
+use chia::puzzles::standard::StandardArgs;
+use chia::puzzles::DeriveSynthetic;
+use chia_bls::{master_to_wallet_unhardened, SecretKey};
+use chia_wallet_sdk::encode_address;
 use std::env;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{net::SocketAddr, time::Duration};
 use tokio::sync::RwLock;
@@ -9,7 +14,6 @@ use tokio::time;
 
 #[derive(Clone, Debug)]
 struct ActiveOffer {
-    coin_ids: Vec<Bytes32>,
     offer: String,
     message_id: String,
 }
@@ -18,6 +22,25 @@ struct ActiveOffer {
 struct WalletState {
     funds: u64,
     active_offers: Vec<ActiveOffer>,
+}
+
+impl WalletState {
+    fn to_json(&self) -> serde_json::Value {
+        let offers: serde_json::Map<String, serde_json::Value> = self
+            .active_offers
+            .iter()
+            .map(|offer| {
+                (
+                    offer.message_id.clone(),
+                    serde_json::Value::String(offer.offer.clone()),
+                )
+            })
+            .collect();
+
+        serde_json::json!({
+            "active_offers": offers
+        })
+    }
 }
 
 async fn handle_root() -> &'static str {
@@ -35,16 +58,32 @@ async fn handle_haz_funds(
     }
 }
 
-async fn handle_offers(State(state): State<Arc<RwLock<WalletState>>>) -> Json<u64> {
+async fn handle_offers(State(state): State<Arc<RwLock<WalletState>>>) -> Json<serde_json::Value> {
     let wallet = state.read().await;
-    Json(wallet.active_offers.len() as u64)
+    Json(wallet.to_json())
 }
 
-async fn refresh_wallet(_startup: bool, state: Arc<RwLock<WalletState>>, _mnemonic: &str) {
+async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic: &str) {
     println!(
         "[{}] Refreshing wallet...",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
     );
+
+    let mnemonic = Mnemonic::from_str(mnemonic).unwrap();
+    let seed = mnemonic.to_seed("");
+    let sk = master_to_wallet_unhardened(&SecretKey::from_seed(&seed), 0).derive_synthetic();
+    let pk = sk.public_key();
+
+    // let layer = StandardLayer::new(pk);
+    let wallet_puzzle_hash = StandardArgs::curry_tree_hash(pk);
+    if startup {
+        let address = encode_address(wallet_puzzle_hash.into(), "xch");
+        println!(
+            "[{}] Wallet address: {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            address.unwrap()
+        );
+    }
 
     let mut wallet = state.write().await;
     wallet.funds = 1337;
