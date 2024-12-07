@@ -1,11 +1,15 @@
 use axum::extract::State;
 use axum::{routing::get, Json, Router};
 use bip39::Mnemonic;
-use chia::protocol::Coin;
+use chia::protocol::{Bytes32, Coin};
 use chia::puzzles::standard::StandardArgs;
 use chia::puzzles::DeriveSynthetic;
 use chia_bls::{master_to_wallet_unhardened, SecretKey};
-use chia_wallet_sdk::{decode_puzzle_hash, encode_address, StandardLayer};
+use chia_wallet_sdk::{decode_address, decode_puzzle_hash, encode_address};
+use config::{
+    ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS, GET_COIN_RECORDS_BY_PUZZLE_HASH_URL,
+    GET_WARP_MESSAGES_URL, LOW_FUNDS_THRESHOLD, MAX_MOJOS_IN_ELIGIBLE_WALLETS, WALLET_START_HEIGHT,
+};
 use serde::Deserialize;
 use std::env;
 use std::str::FromStr;
@@ -13,6 +17,8 @@ use std::sync::Arc;
 use std::{net::SocketAddr, time::Duration};
 use tokio::sync::RwLock;
 use tokio::time;
+
+mod config;
 
 #[derive(Clone, Debug)]
 struct ActiveOffer {
@@ -53,7 +59,7 @@ async fn handle_haz_funds(
     State(state): State<Arc<RwLock<WalletState>>>,
 ) -> (axum::http::StatusCode, &'static str) {
     let wallet = state.read().await;
-    if wallet.funds > 4_200_000_000_000 {
+    if wallet.funds > LOW_FUNDS_THRESHOLD {
         (axum::http::StatusCode::OK, "OK")
     } else {
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, "LOW FUNDS")
@@ -85,33 +91,12 @@ struct DeserializableCoin {
     puzzle_hash: String,
 }
 
-async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic: &str) {
-    println!(
-        "[{}] Refreshing wallet...",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
-
-    let mnemonic = Mnemonic::from_str(mnemonic).unwrap();
-    let seed = mnemonic.to_seed("");
-    let sk = master_to_wallet_unhardened(&SecretKey::from_seed(&seed), 0).derive_synthetic();
-    let pk = sk.public_key();
-
-    let layer = StandardLayer::new(pk);
-    let wallet_puzzle_hash = StandardArgs::curry_tree_hash(pk);
-    if startup {
-        let address = encode_address(wallet_puzzle_hash.into(), "xch");
-        println!(
-            "[{}] Wallet address: {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            address.unwrap()
-        );
-    }
-
+async fn get_unspent_coins(puzzle_hash: Bytes32) -> Vec<Coin> {
     let response = reqwest::Client::new()
-        .post("https://api.coinset.org/get_coin_records_by_puzzle_hash")
+        .post(GET_COIN_RECORDS_BY_PUZZLE_HASH_URL)
         .json(&serde_json::json!({
-            "puzzle_hash": wallet_puzzle_hash.to_string(),
-            "start_height": 63000000,
+            "puzzle_hash": puzzle_hash.to_string(),
+            "start_height": WALLET_START_HEIGHT,
             "end_height": 0,
             "include_spent_coins": false
         }))
@@ -120,9 +105,9 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
         .expect("Failed to send request")
         .json::<CoinRecordsResponse>()
         .await
-        .expect("Failed to parse response");
+        .expect("Coinset down");
 
-    let coins: Vec<Coin> = response
+    response
         .coin_records
         .into_iter()
         .map(|record| {
@@ -134,12 +119,126 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
                 record.coin.amount,
             )
         })
-        .collect();
+        .collect()
+}
 
-    println!("Coins: {:?}", coins);
+#[derive(Deserialize)]
+struct ParsedMessage {
+    token_symbol: String,
+    amount_mojo: u64,
+    receiver: String,
+}
+
+#[derive(Deserialize)]
+struct PendingMessage {
+    nonce: String,
+    source_chain: String,
+    parsed: ParsedMessage,
+}
+
+async fn get_pending_messages() -> Vec<PendingMessage> {
+    reqwest::Client::new()
+        .get(GET_WARP_MESSAGES_URL)
+        .send()
+        .await
+        .expect("Failed to fetch pending messages")
+        .json::<Vec<PendingMessage>>()
+        .await
+        .expect("Failed to parse pending messages")
+}
+
+struct OfferToGenerate {
+    message_id: String,
+    recipient: Bytes32,
+    amount_to_offer: u64,
+}
+
+async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic: &str) {
+    println!(
+        "[{}] Refreshing wallet...",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+
+    let mnemonic = Mnemonic::from_str(mnemonic).unwrap();
+    let seed = mnemonic.to_seed("");
+    let sk = master_to_wallet_unhardened(&SecretKey::from_seed(&seed), 0).derive_synthetic();
+    let pk = sk.public_key();
+
+    // let layer = StandardLayer::new(pk);
+    let wallet_puzzle_hash = StandardArgs::curry_tree_hash(pk);
+    if startup {
+        let address = encode_address(wallet_puzzle_hash.into(), "xch");
+        println!(
+            "[{}] Wallet address: {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            address.unwrap()
+        );
+    }
+
+    let wallet_coins = get_unspent_coins(wallet_puzzle_hash.into()).await;
+
+    let mut offers_to_generate: Vec<OfferToGenerate> = Vec::new();
+    let pending_messages = get_pending_messages().await;
+
+    for message in pending_messages {
+        let message_id = message.source_chain.clone() + "-" + &message.nonce;
+
+        let mut min_amount: Option<u64> = None;
+        for (symbol, assoc_min_amount) in ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS {
+            if message.parsed.token_symbol == symbol {
+                min_amount = Some(assoc_min_amount);
+                break;
+            }
+        }
+
+        if let Some(min_amount) = min_amount {
+            if message.parsed.amount_mojo < min_amount {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        // We know:
+        //  - The message is to XCH (from URL)
+        //  - The message is pending (relay not completed - also URL)
+        //  - An eligible token is being transferred
+        //  - The amount is greater than the minimum amount for that token
+        // So check that the wallet is not super well-funded and that's it.
+
+        let recipient: Bytes32 = decode_address(&message.parsed.receiver).unwrap().0.into();
+        let recipient_coins = get_unspent_coins(recipient).await;
+        let recipient_funds = recipient_coins.iter().map(|c| c.amount).sum::<u64>();
+        if recipient_funds > MAX_MOJOS_IN_ELIGIBLE_WALLETS {
+            continue;
+        }
+
+        offers_to_generate.push(OfferToGenerate {
+            message_id,
+            recipient,
+            amount_to_offer: message.parsed.amount_mojo,
+        });
+    }
 
     let mut wallet = state.write().await;
-    wallet.funds = coins.iter().map(|c| c.amount).sum();
+    wallet.funds = wallet_coins.iter().map(|c| c.amount).sum();
+
+    println!(
+        "[{}] Offers to generate: {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        offers_to_generate
+            .iter()
+            .map(|o| o.message_id.clone())
+            .collect::<Vec<String>>()
+            .join(", ")
+    );
+
+    println!(
+        "[{}] Done refreshing wallet with {} coins (total funds: {} XCH)",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        wallet_coins.len(),
+        wallet.funds as f64 / 1_000_000_000_000.0
+    );
 }
 
 async fn scheduled_task(state: Arc<RwLock<WalletState>>, mnemonic: String) {
