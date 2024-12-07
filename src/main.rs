@@ -1,15 +1,23 @@
 use axum::extract::State;
 use axum::{routing::get, Json, Router};
 use bip39::Mnemonic;
-use chia::protocol::{Bytes32, Coin};
+use chia::clvm_traits::{FromClvm, ToClvm};
+use chia::clvm_utils::{CurriedProgram, ToTreeHash};
+use chia::protocol::{Bytes, Bytes32, Coin, SpendBundle};
+use chia::puzzles::offer::SETTLEMENT_PAYMENTS_PUZZLE_HASH;
+use chia::puzzles::singleton::SingletonStruct;
 use chia::puzzles::standard::StandardArgs;
 use chia::puzzles::DeriveSynthetic;
-use chia_bls::{master_to_wallet_unhardened, SecretKey};
-use chia_wallet_sdk::{decode_address, decode_puzzle_hash, encode_address, select_coins};
+use chia_bls::{master_to_wallet_unhardened, sign, SecretKey, Signature};
+use chia_wallet_sdk::{
+    decode_address, decode_puzzle_hash, encode_address, select_coins, AggSigConstants, Conditions,
+    Offer, RequiredSignature, SpendContext, StandardLayer, MAINNET_CONSTANTS,
+};
+use clvmr::serde::node_from_bytes;
 use config::{
     ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS, GET_COIN_RECORDS_BY_PUZZLE_HASH_URL,
-    GET_WARP_MESSAGES_URL, LOW_FUNDS_THRESHOLD, MAX_MOJOS_IN_ELIGIBLE_WALLETS, WALLET_START_HEIGHT,
-    WELCOME_KIT_AMOUNT,
+    GET_WARP_MESSAGES_URL, LOW_FUNDS_THRESHOLD, MAX_MOJOS_IN_ELIGIBLE_WALLETS, MESSAGE_COIN_MOD,
+    PORTAL_LAUNCHER_ID, WALLET_START_HEIGHT, WELCOME_KIT_AMOUNT,
 };
 use serde::Deserialize;
 use std::env;
@@ -134,6 +142,9 @@ struct ParsedMessage {
 struct PendingMessage {
     nonce: String,
     source_chain: String,
+    source: String,
+    destination: String,
+    contents: Vec<String>,
     parsed: ParsedMessage,
 }
 
@@ -148,10 +159,122 @@ async fn get_pending_messages() -> Vec<PendingMessage> {
         .expect("Failed to parse pending messages")
 }
 
-struct OfferToGenerate {
-    message_id: String,
-    recipient: Bytes32,
-    amount_to_offer: u64,
+#[derive(Debug, Clone, PartialEq, Eq, ToClvm, FromClvm)]
+#[clvm(list)]
+pub struct UniqueMessageInfo {
+    pub source_chain: Bytes,
+    #[clvm(rest)]
+    pub nonce: Bytes32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToClvm, FromClvm)]
+#[clvm(curry)]
+pub struct MessageCoinFirstCurryArgs {
+    pub portal_singleton_struct: SingletonStruct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToClvm, FromClvm)]
+#[clvm(curry)]
+pub struct MessageCoinSecondCurryArgs {
+    pub unique_info: UniqueMessageInfo,
+    pub source: Bytes,
+    pub destination: Bytes32,
+    pub message_hash: Bytes32,
+}
+
+fn generate_offer(msg: PendingMessage, selected_coins: Vec<Coin>, sk: &SecretKey) -> String {
+    let ctx = &mut SpendContext::new();
+
+    // first, determine the puzzle hash of the message coin
+    let message_mod = node_from_bytes(&mut ctx.allocator, &MESSAGE_COIN_MOD).unwrap();
+    let first_curry = CurriedProgram {
+        program: message_mod,
+        args: MessageCoinFirstCurryArgs {
+            portal_singleton_struct: SingletonStruct::new(PORTAL_LAUNCHER_ID.into()),
+        },
+    }
+    .to_clvm(&mut ctx.allocator)
+    .unwrap();
+    let contents: Vec<Bytes32> = msg
+        .contents
+        .iter()
+        .map(|c| decode_puzzle_hash(c).unwrap().into())
+        .collect();
+    let second_curry = CurriedProgram {
+        program: first_curry,
+        args: MessageCoinSecondCurryArgs {
+            unique_info: UniqueMessageInfo {
+                source_chain: msg.source_chain.as_bytes().to_vec().into(),
+                nonce: decode_puzzle_hash(&msg.nonce).unwrap().into(),
+            },
+            source: hex::decode(&msg.source).unwrap().into(),
+            destination: decode_puzzle_hash(&msg.destination).unwrap().into(),
+            message_hash: contents.tree_hash().into(),
+        },
+    }
+    .to_clvm(&mut ctx.allocator)
+    .unwrap();
+    let message_coin_puzzle_hash = ctx.tree_hash(second_curry);
+
+    let total_coin_amount = selected_coins.iter().map(|c| c.amount).sum::<u64>();
+    let offer_amount = msg.parsed.amount_mojo;
+
+    let pk = sk.public_key();
+    let layer = StandardLayer::new(pk);
+
+    let lead_coin = selected_coins[0];
+    for other_coin in selected_coins[1..].iter() {
+        layer
+            .clone()
+            .spend(
+                ctx,
+                *other_coin,
+                Conditions::new().assert_concurrent_spend(lead_coin.coin_id()),
+            )
+            .unwrap();
+    }
+
+    let mut lead_coin_conditions = Conditions::new()
+        .create_coin(SETTLEMENT_PAYMENTS_PUZZLE_HASH.into(), offer_amount, vec![])
+        .create_coin(
+            decode_address(&msg.parsed.receiver).unwrap().0.into(),
+            WELCOME_KIT_AMOUNT,
+            vec![],
+        )
+        .assert_concurrent_puzzle(message_coin_puzzle_hash.into());
+
+    let change = total_coin_amount - offer_amount - WELCOME_KIT_AMOUNT;
+    if change > 42 * WELCOME_KIT_AMOUNT {
+        let change1 = change / 2 - 4;
+        let change2 = change - change1;
+        lead_coin_conditions = lead_coin_conditions
+            .create_coin(lead_coin.puzzle_hash, change1, vec![])
+            .create_coin(lead_coin.puzzle_hash, change2, vec![]);
+    } else {
+        lead_coin_conditions =
+            lead_coin_conditions.create_coin(lead_coin.puzzle_hash, change, vec![]);
+    }
+
+    layer.spend(ctx, lead_coin, lead_coin_conditions).unwrap();
+
+    let coin_spends = ctx.take();
+    let required_sig = RequiredSignature::from_coin_spends(
+        &mut ctx.allocator,
+        &coin_spends,
+        &AggSigConstants::new(MAINNET_CONSTANTS.agg_sig_me_additional_data),
+    )
+    .unwrap();
+    let mut sigs: Vec<Signature> = vec![];
+    for req in required_sig {
+        sigs.push(sign(sk, req.final_message()));
+    }
+
+    let offer = Offer::new(SpendBundle {
+        coin_spends,
+        aggregated_signature: sigs.into_iter().reduce(|a, b| a + &b).unwrap(),
+    });
+
+    offer.encode().unwrap()
 }
 
 async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic: &str) {
@@ -165,7 +288,6 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     let sk = master_to_wallet_unhardened(&SecretKey::from_seed(&seed), 0).derive_synthetic();
     let pk = sk.public_key();
 
-    // let layer = StandardLayer::new(pk);
     let wallet_puzzle_hash = StandardArgs::curry_tree_hash(pk);
     if startup {
         let address = encode_address(wallet_puzzle_hash.into(), "xch");
@@ -178,12 +300,10 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
 
     let wallet_coins = get_unspent_coins(wallet_puzzle_hash.into()).await;
 
-    let mut offers_to_generate: Vec<OfferToGenerate> = Vec::new();
+    let mut pending_messages_to_process: Vec<PendingMessage> = Vec::new();
     let pending_messages = get_pending_messages().await;
 
     for message in pending_messages {
-        let message_id = message.source_chain.clone() + "-" + &message.nonce;
-
         let mut min_amount: Option<u64> = None;
         for (symbol, assoc_min_amount) in ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS {
             if message.parsed.token_symbol == symbol {
@@ -214,33 +334,30 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
             continue;
         }
 
-        offers_to_generate.push(OfferToGenerate {
-            message_id,
-            recipient,
-            amount_to_offer: message.parsed.amount_mojo,
-        });
+        pending_messages_to_process.push(message);
     }
 
     let mut new_offers: Vec<ActiveOffer> = Vec::new();
     let mut coins_to_select_from: Vec<Coin> = wallet_coins.clone();
 
-    for offer in offers_to_generate {
+    for pending_message in pending_messages_to_process {
         let Ok(selected_coins) = select_coins(
             coins_to_select_from.clone(),
-            (offer.amount_to_offer + WELCOME_KIT_AMOUNT).into(),
+            (pending_message.parsed.amount_mojo + WELCOME_KIT_AMOUNT).into(),
         ) else {
             println!(
-                "[{}] Not enough funds to generate offer {}",
+                "[{}] Not enough funds to generate offer {}-{}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                offer.message_id
+                pending_message.source_chain,
+                pending_message.nonce
             );
             break;
         };
         coins_to_select_from.retain(|c| !selected_coins.contains(c));
 
         new_offers.push(ActiveOffer {
-            message_id: offer.message_id,
-            offer: "TODO".to_string(),
+            message_id: pending_message.source_chain.clone() + "-" + &pending_message.nonce,
+            offer: generate_offer(pending_message, selected_coins, &sk),
         });
     }
 
