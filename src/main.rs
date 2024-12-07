@@ -5,10 +5,11 @@ use chia::protocol::{Bytes32, Coin};
 use chia::puzzles::standard::StandardArgs;
 use chia::puzzles::DeriveSynthetic;
 use chia_bls::{master_to_wallet_unhardened, SecretKey};
-use chia_wallet_sdk::{decode_address, decode_puzzle_hash, encode_address};
+use chia_wallet_sdk::{decode_address, decode_puzzle_hash, encode_address, select_coins};
 use config::{
     ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS, GET_COIN_RECORDS_BY_PUZZLE_HASH_URL,
     GET_WARP_MESSAGES_URL, LOW_FUNDS_THRESHOLD, MAX_MOJOS_IN_ELIGIBLE_WALLETS, WALLET_START_HEIGHT,
+    WELCOME_KIT_AMOUNT,
 };
 use serde::Deserialize;
 use std::env;
@@ -220,24 +221,39 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
         });
     }
 
+    let mut new_offers: Vec<ActiveOffer> = Vec::new();
+    let mut coins_to_select_from: Vec<Coin> = wallet_coins.clone();
+
+    for offer in offers_to_generate {
+        let Ok(selected_coins) = select_coins(
+            coins_to_select_from.clone(),
+            (offer.amount_to_offer + WELCOME_KIT_AMOUNT).into(),
+        ) else {
+            println!(
+                "[{}] Not enough funds to generate offer {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                offer.message_id
+            );
+            break;
+        };
+        coins_to_select_from.retain(|c| !selected_coins.contains(c));
+
+        new_offers.push(ActiveOffer {
+            message_id: offer.message_id,
+            offer: "TODO".to_string(),
+        });
+    }
+
     let mut wallet = state.write().await;
     wallet.funds = wallet_coins.iter().map(|c| c.amount).sum();
+    wallet.active_offers = new_offers;
 
     println!(
-        "[{}] Offers to generate: {}",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        offers_to_generate
-            .iter()
-            .map(|o| o.message_id.clone())
-            .collect::<Vec<String>>()
-            .join(", ")
-    );
-
-    println!(
-        "[{}] Done refreshing wallet with {} coins (total funds: {} XCH)",
+        "[{}] Done refreshing wallet with {} coins - total funds: {} XCH; active offers: {}",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         wallet_coins.len(),
-        wallet.funds as f64 / 1_000_000_000_000.0
+        wallet.funds as f64 / 1_000_000_000_000.0,
+        wallet.active_offers.len()
     );
 }
 
