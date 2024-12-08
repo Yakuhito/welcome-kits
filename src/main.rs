@@ -217,7 +217,11 @@ fn generate_offer(msg: PendingMessage, selected_coins: Vec<Coin>, sk: &SecretKey
     let message_coin_puzzle_hash = ctx.tree_hash(second_curry);
 
     let total_coin_amount = selected_coins.iter().map(|c| c.amount).sum::<u64>();
-    let offer_amount = msg.parsed.amount_mojo;
+    let offer_amount = if msg.parsed.token_symbol == "XCH" {
+        1
+    } else {
+        msg.parsed.amount_mojo
+    };
 
     let pk = sk.public_key();
     let layer = StandardLayer::new(pk);
