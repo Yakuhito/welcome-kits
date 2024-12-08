@@ -6,7 +6,7 @@ pub const GET_WARP_MESSAGES_URL: &str =
     "https://watcher-api.warp.green/messages?limit=100&destination_chain=xch&status=sent&order_by=id&sort=asc";
 
 pub const WELCOME_KIT_AMOUNT: u64 = 420_000_000; // 0.00042 XCH
-pub const LOW_FUNDS_THRESHOLD: u64 = 4_200_000_000_000; // 0.42 XCH
+pub const LOW_FUNDS_THRESHOLD: u64 = 420_000_000_000; // 0.42 XCH
 pub const WALLET_START_HEIGHT: u64 = 6_300_000;
 
 // for mainnet
