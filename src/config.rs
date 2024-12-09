@@ -10,10 +10,10 @@ pub const LOW_FUNDS_THRESHOLD: u64 = 420_000_000_000; // 0.42 XCH
 pub const WALLET_START_HEIGHT: u64 = 6_300_000;
 
 // for mainnet
-pub const MAX_MOJOS_IN_ELIGIBLE_WALLETS: u64 = 10_000_000_000; // 0.01 XCH
+pub const MAX_MOJOS_IN_ELIGIBLE_WALLETS: u64 = 100_000_000_000; // 0.1 XCH
 pub const ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS: [(&str, u64); 4] = [
     ("milliETH", 10_000),     // 10 milliETH, or 0.01 ETH
-    ("USDC", 42_000),         // 40 USDC
+    ("USDC", 42_000),         // 42 USDC
     ("USDT", 42_000),         // 42 USDT
     ("XCH", 100_000_000_000), // 0.1 XCH
 ];

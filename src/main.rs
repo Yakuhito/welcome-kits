@@ -83,6 +83,7 @@ async fn handle_offers(State(state): State<Arc<RwLock<WalletState>>>) -> Json<se
 #[derive(Deserialize)]
 struct CoinRecord {
     coin: DeserializableCoin,
+    spent: bool,
     // We don't need to define the other fields since we won't use them
     #[serde(skip)]
     _ignored: serde::de::IgnoredAny,
@@ -119,6 +120,7 @@ async fn get_unspent_coins(puzzle_hash: Bytes32) -> Vec<Coin> {
     response
         .coin_records
         .into_iter()
+        .filter(|record| !record.spent)
         .map(|record| {
             Coin::new(
                 decode_puzzle_hash(&record.coin.parent_coin_info)
@@ -303,6 +305,7 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     }
 
     let wallet_coins = get_unspent_coins(wallet_puzzle_hash.into()).await;
+    println!("wallet_coins: {:?}", wallet_coins);
 
     let mut pending_messages_to_process: Vec<PendingMessage> = Vec::new();
     let pending_messages = get_pending_messages().await;
@@ -347,7 +350,12 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     for pending_message in pending_messages_to_process {
         let Ok(selected_coins) = select_coins(
             coins_to_select_from.clone(),
-            (pending_message.parsed.amount_mojo + WELCOME_KIT_AMOUNT).into(),
+            (if pending_message.parsed.token_symbol == "XCH" {
+                1
+            } else {
+                pending_message.parsed.amount_mojo + WELCOME_KIT_AMOUNT
+            })
+            .into(),
         ) else {
             println!(
                 "[{}] Not enough funds to generate offer {}-{}",
