@@ -305,7 +305,6 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     }
 
     let wallet_coins = get_unspent_coins(wallet_puzzle_hash.into()).await;
-    println!("wallet_coins: {:?}", wallet_coins);
 
     let mut pending_messages_to_process: Vec<PendingMessage> = Vec::new();
     let pending_messages = get_pending_messages().await;
