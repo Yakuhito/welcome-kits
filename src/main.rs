@@ -350,7 +350,7 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
         let Ok(selected_coins) = select_coins(
             coins_to_select_from.clone(),
             (if pending_message.parsed.token_symbol == "XCH" {
-                1
+                1 + WELCOME_KIT_AMOUNT
             } else {
                 pending_message.parsed.amount_mojo + WELCOME_KIT_AMOUNT
             })
