@@ -106,8 +106,6 @@ async fn get_unspent_coins(puzzle_hash: Bytes32) -> Vec<Coin> {
         .post(GET_COIN_RECORDS_BY_PUZZLE_HASH_URL)
         .json(&serde_json::json!({
             "puzzle_hash": puzzle_hash.to_string(),
-            "start_height": WALLET_START_HEIGHT,
-            "end_height": 0,
             "include_spent_coins": false
         }))
         .send()
