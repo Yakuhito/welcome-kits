@@ -7,7 +7,6 @@ pub const GET_WARP_MESSAGES_URL: &str =
 
 pub const WELCOME_KIT_AMOUNT: u64 = 420_000_000; // 0.00042 XCH
 pub const LOW_FUNDS_THRESHOLD: u64 = 420_000_000_000; // 0.42 XCH
-pub const WALLET_START_HEIGHT: u64 = 6_300_000;
 
 // for mainnet
 pub const MAX_MOJOS_IN_ELIGIBLE_WALLETS: u64 = 100_000_000_000; // 0.1 XCH
