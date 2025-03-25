@@ -131,14 +131,14 @@ async fn get_unspent_coins(puzzle_hash: Bytes32) -> Vec<Coin> {
         .collect()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ParsedMessage {
-    token_symbol: String,
-    amount_mojo: u64,
-    receiver: String,
+    token_symbol: Option<String>,
+    amount_mojo: Option<u64>,
+    receiver: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct PendingMessage {
     nonce: String,
     source_chain: String,
@@ -217,10 +217,17 @@ fn generate_offer(msg: PendingMessage, selected_coins: Vec<Coin>, sk: &SecretKey
     let message_coin_puzzle_hash = ctx.tree_hash(second_curry);
 
     let total_coin_amount = selected_coins.iter().map(|c| c.amount).sum::<u64>();
-    let offer_amount = if msg.parsed.token_symbol == "XCH" {
+    let (Some(token_symbol), Some(amount_mojo), Some(receiver)) = (
+        msg.parsed.token_symbol,
+        msg.parsed.amount_mojo,
+        msg.parsed.receiver,
+    ) else {
+        return "".to_string();
+    };
+    let offer_amount = if token_symbol == "XCH" {
         1
     } else {
-        msg.parsed.amount_mojo
+        amount_mojo
     };
 
     let pk = sk.public_key();
@@ -241,7 +248,7 @@ fn generate_offer(msg: PendingMessage, selected_coins: Vec<Coin>, sk: &SecretKey
     let mut lead_coin_conditions = Conditions::new()
         .create_coin(SETTLEMENT_PAYMENTS_PUZZLE_HASH.into(), offer_amount, vec![])
         .create_coin(
-            decode_address(&msg.parsed.receiver).unwrap().0.into(),
+            decode_address(&receiver).unwrap().0.into(),
             WELCOME_KIT_AMOUNT,
             vec![],
         )
@@ -308,16 +315,24 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     let pending_messages = get_pending_messages().await;
 
     for message in pending_messages {
+        let (Some(token_symbol), Some(amount_mojo), Some(receiver)) = (
+            message.parsed.token_symbol.clone(),
+            message.parsed.amount_mojo,
+            message.parsed.receiver.clone(),
+        ) else {
+            continue;
+        };
+
         let mut min_amount: Option<u64> = None;
         for (symbol, assoc_min_amount) in ELIGIBLE_SYMBOLS_AND_MINIMUM_AMOUNTS {
-            if message.parsed.token_symbol == symbol {
+            if token_symbol == symbol {
                 min_amount = Some(assoc_min_amount);
                 break;
             }
         }
 
         if let Some(min_amount) = min_amount {
-            if message.parsed.amount_mojo < min_amount {
+            if amount_mojo < min_amount {
                 continue;
             }
         } else {
@@ -331,7 +346,7 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
         //  - The amount is greater than the minimum amount for that token
         // So check that the wallet is not super well-funded and that's it.
 
-        let recipient: Bytes32 = decode_address(&message.parsed.receiver).unwrap().0.into();
+        let recipient: Bytes32 = decode_address(&receiver).unwrap().0.into();
         let recipient_coins = get_unspent_coins(recipient).await;
         let recipient_funds = recipient_coins.iter().map(|c| c.amount).sum::<u64>();
         if recipient_funds > MAX_MOJOS_IN_ELIGIBLE_WALLETS {
@@ -345,12 +360,19 @@ async fn refresh_wallet(startup: bool, state: Arc<RwLock<WalletState>>, mnemonic
     let mut coins_to_select_from: Vec<Coin> = wallet_coins.clone();
 
     for pending_message in pending_messages_to_process {
+        let (Some(token_symbol), Some(amount_mojo)) = (
+            pending_message.parsed.token_symbol.clone(),
+            pending_message.parsed.amount_mojo,
+        ) else {
+            continue;
+        };
+
         let Ok(selected_coins) = select_coins(
             coins_to_select_from.clone(),
-            (if pending_message.parsed.token_symbol == "XCH" {
+            (if token_symbol == "XCH" {
                 1 + WELCOME_KIT_AMOUNT
             } else {
-                pending_message.parsed.amount_mojo + WELCOME_KIT_AMOUNT
+                amount_mojo + WELCOME_KIT_AMOUNT
             })
             .into(),
         ) else {
